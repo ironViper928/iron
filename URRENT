@@ -1,0 +1,109 @@
+-- 电商数据库：用户行为分析、销售报表、留存率计算
+
+-- 1. 每个品类 TOP3 畅销商品（窗口函数）
+WITH ranked_products AS (
+    SELECT
+        p.category_id,
+        c.name AS category_name,
+        p.product_id,
+        p.name AS product_name,
+        SUM(oi.quantity) AS total_sold,
+        SUM(oi.quantity * oi.unit_price) AS total_revenue,
+        ROW_NUMBER() OVER (
+            PARTITION BY p.category_id
+            ORDER BY SUM(oi.quantity * oi.unit_price) DESC
+        ) AS rank_in_category
+    FROM order_items oi
+    JOIN products p ON oi.product_id = p.product_id
+    JOIN categories c ON p.category_id = c.category_id
+    JOIN orders o ON oi.order_id = o.order_id
+    WHERE o.status = 'completed'
+      AND o.created_at >= DATE_TRUNC('month', CURRENT_DATE - INTERVAL '3 months')
+    GROUP BY p.category_id, c.name, p.product_id, p.name
+)
+SELECT category_name, product_name, total_sold, total_revenue, rank_in_category
+FROM ranked_products
+WHERE rank_in_category <= 3
+ORDER BY category_name, rank_in_category;
+
+-- 2. 用户月度留存率（同期群分析）
+WITH cohorts AS (
+    SELECT
+        user_id,
+        DATE_TRUNC('month', MIN(created_at)) AS cohort_month
+    FROM orders
+    GROUP BY user_id
+),
+user_activity AS (
+    SELECT
+        o.user_id,
+        c.cohort_month,
+        DATE_TRUNC('month', o.created_at) AS activity_month,
+        EXTRACT(EPOCH FROM (
+            DATE_TRUNC('month', o.created_at) - c.cohort_month
+        )) / 2592000 AS months_since_cohort
+    FROM orders o
+    JOIN cohorts c ON o.user_id = c.user_id
+    WHERE o.status != 'cancelled'
+),
+cohort_sizes AS (
+    SELECT cohort_month, COUNT(DISTINCT user_id) AS cohort_size
+    FROM cohorts
+    GROUP BY cohort_month
+)
+SELECT
+    ua.cohort_month,
+    cs.cohort_size,
+    ua.months_since_cohort::INTEGER AS month_number,
+    COUNT(DISTINCT ua.user_id) AS retained_users,
+    ROUND(
+        COUNT(DISTINCT ua.user_id) * 100.0 / cs.cohort_size, 2
+    ) AS retention_rate
+FROM user_activity ua
+JOIN cohort_sizes cs ON ua.cohort_month = cs.cohort_month
+GROUP BY ua.cohort_month, cs.cohort_size, ua.months_since_cohort
+ORDER BY ua.cohort_month, month_number;
+
+-- 3. 复购率与用户 LTV 估算
+WITH user_stats AS (
+    SELECT
+        u.user_id,
+        u.email,
+        u.created_at AS register_date,
+        COUNT(DISTINCT o.order_id) AS order_count,
+        SUM(o.total_amount) AS lifetime_value,
+        MIN(o.created_at) AS first_order,
+        MAX(o.created_at) AS last_order,
+        AVG(o.total_amount) AS avg_order_value,
+        EXTRACT(DAY FROM MAX(o.created_at) - MIN(o.created_at)) AS days_active
+    FROM users u
+    LEFT JOIN orders o ON u.user_id = o.user_id AND o.status = 'completed'
+    GROUP BY u.user_id, u.email, u.created_at
+),
+segmented AS (
+    SELECT *,
+        CASE
+            WHEN order_count = 0 THEN 'never_purchased'
+            WHEN order_count = 1 THEN 'one_time'
+            WHEN order_count BETWEEN 2 AND 4 THEN 'occasional'
+            WHEN order_count BETWEEN 5 AND 10 THEN 'regular'
+            ELSE 'vip'
+        END AS segment,
+        CASE
+            WHEN last_order < CURRENT_DATE - INTERVAL '90 days' THEN 'churned'
+            WHEN last_order < CURRENT_DATE - INTERVAL '30 days' THEN 'at_risk'
+            ELSE 'active'
+        END AS recency_status
+    FROM user_stats
+)
+SELECT
+    segment,
+    recency_status,
+    COUNT(*) AS user_count,
+    ROUND(AVG(lifetime_value), 2) AS avg_ltv,
+    ROUND(AVG(order_count), 2) AS avg_orders,
+    ROUND(AVG(avg_order_value), 2) AS avg_basket_size,
+    SUM(lifetime_value) AS total_revenue
+FROM segmented
+GROUP BY segment, recency_status
+ORDER BY total_revenue DESC;
